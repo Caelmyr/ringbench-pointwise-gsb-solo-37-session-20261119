@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>RingBench · 面探测器图像工作台</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script type="module" src="/static/main.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="RingBench 首页">
+      <span class="emblem" aria-hidden="true"></span>
+      <span><strong>RingBench</strong><small>面探测器图像工作台</small></span>
+    </a>
+    <section id="project-actions" aria-label="项目管理"></section>
+  </header>
+  <main id="main" aria-label="RingBench 工作台">
+    <section id="welcome" class="welcome">
+      <div class="welcome-card">
+        <div class="welcome-signal" aria-hidden="true"><div></div></div>
+        <div>
+          <h1>读懂衍射图上的每一环</h1>
+          <p>标定环心，排除探测器坏区。保留原始计数，在同一坐标中查看衍射环、斑点和曝光差异。</p>
+          <div id="demo-actions" class="demo-actions"></div>
+        </div>
+      </div>
+      <div class="open-panel">
+        <form id="upload-project" class="form-stack">
+          <h2>导入探测器图像</h2>
+          <label>工程名 <input name="title" placeholder="如样本 041 · 室温曝光"></label>
+          <label>灰度 PNG、TIFF 或二维 NPY <input type="file" name="image" accept=".png,.tif,.tiff,.npy" required></label>
+          <button type="submit">新建工程</button>
+        </form>
+        <form id="restore-project" class="form-stack">
+          <h2>恢复工程</h2>
+          <label>RingBench 工程 ZIP <input type="file" name="archive" accept=".zip" required></label>
+          <button type="submit" class="secondary">恢复归档</button>
+          <div id="saved-projects" class="saved" aria-label="已保存工程"></div>
+        </form>
+      </div>
+    </section>
+    <section id="workspace" class="workspace" hidden>
+      <aside id="input-sidebar" class="left-pane" aria-label="探测器输入"></aside>
+      <section class="main-pane">
+        <div class="work-header">
+          <div>
+            <h1 id="workspace-title"></h1>
+            <p id="workspace-subtitle"></p>
+          </div>
+          <div id="view-actions" class="view-actions"></div>
+        </div>
+        <nav id="views" class="tabbar" aria-label="分析视图"></nav>
+        <div id="view-body" class="view-body" aria-live="polite"></div>
+        <div id="readout" class="readout" aria-live="polite" hidden></div>
+      </section>
+      <aside id="controls" class="right-pane" aria-label="当前分析的设置"></aside>
+    </section>
+  </main>
+  <div id="notice" class="notice" role="status" hidden></div>
+  <dialog id="manager" aria-labelledby="manager-title"></dialog>
+</body>
+</html>

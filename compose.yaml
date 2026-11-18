@@ -1,0 +1,16 @@
+name: solo40-ringbench
+services:
+  ringbench:
+    build: .
+    image: solo40-ringbench:1.0
+    ports:
+      - "${RINGBENCH_BIND:-127.0.0.1}:${RINGBENCH_PORT:-18940}:18940"
+    volumes:
+      - ringbench-data:/data
+volumes:
+  ringbench-data:
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: "${RINGBENCH_SUBNET:-10.89.240.0/28}"
