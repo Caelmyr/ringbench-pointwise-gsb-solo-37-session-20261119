@@ -222,6 +222,12 @@ def probe(pid):
     return jsonify(workbench().probe(pid, *selection_args(), point))
 
 
+@api.get("/projects/<pid>/column-defects")
+def column_defects(pid):
+    desc, suggestion = workbench().column_defects(pid, *selection_args())
+    return jsonify({**desc, **suggestion})
+
+
 @api.post("/projects/<pid>/calibration/circle")
 def find_center(pid):
     body = json_content()

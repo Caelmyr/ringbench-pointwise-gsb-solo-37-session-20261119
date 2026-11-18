@@ -4,6 +4,7 @@ from dataclasses import asdict
 import numpy as np
 
 from .contours import ContourSettings, extract_contours
+from .column_defects import suggest_column_defects
 from .correction import ResponseSettings, correct
 from .coverage import CoverageSpec, estimate_coverage
 from .detector_io import array_bytes, finite_summary
@@ -153,6 +154,13 @@ class Workbench:
     def probe(self, pid, fid, rev, point):
         det = self.detector(pid, fid, rev)
         return {**det.description(), "pixel": read_pixel(det.counts, det.mask, det.geometry, point)}
+
+    def column_defects(self, pid, fid, rev):
+        def make(det):
+            suggestion = suggest_column_defects(det.counts, det.valid)
+            return det.description(), suggestion
+
+        return self._cached(pid, fid, rev, "column-defects", make)
 
     def calibration(self, pid, rev, marks=None):
         project, _ = self._version(pid, None, rev)

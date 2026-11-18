@@ -61,6 +61,21 @@ function overlay(pen, canvas, config, ctx) {
     pen.strokeRect(X(start[0] - .5), Y(start[1] - .5),
       X(stop[0] - .5) - X(start[0] - .5), Y(stop[1] - .5) - Y(start[1] - .5));
   }
+  if (config.columnDefects) {
+    pen.save();
+    pen.fillStyle = "rgba(255, 92, 122, 0.16)";
+    pen.strokeStyle = "rgba(255, 111, 138, 0.95)";
+    pen.lineWidth = 1.4;
+    for (const region of config.columnDefects) {
+      const px = X(region.x0 - .5);
+      const py = Y(region.y0 - .5);
+      const pw = X(region.x1 + .5) - px;
+      const ph = Y(region.y1 - .5) - py;
+      pen.fillRect(px, py, pw, ph);
+      pen.strokeRect(px, py, pw, ph);
+    }
+    pen.restore();
+  }
   for (const radius of config.radii ?? []) oval(g.cx, g.cy, radius, "#ffba69ae", 1.5);
   for (const [x,y] of config.markers ?? []) {
     shape(pen, colors.orange, 1.6, () => pen.arc(X(x), Y(y), 2.5, 0, 2*Math.PI));
@@ -183,6 +198,28 @@ function maskPanel(layers, imported) {
   </section>`;
 }
 
+function columnDefectPanel(session, suggestion) {
+  const active = session.columnDefects ?? false;
+  const count = suggestion?.count ?? 0;
+  const rows = (suggestion?.regions ?? []).slice(0, 8).map((r) =>
+    `<tr><td>${r.x0}${r.x1 > r.x0 ? `–${r.x1}` : ""}</td><td>${r.y0}–${r.y1 - 1}</td>
+     <td>${r.height}</td><td>${fmt(r.median_ratio, 2)}</td></tr>`).join("");
+  return `<section class="side-group"><h2>纵向坏区建议</h2>
+  <p class="note">比较每列与相邻同行列的读数，识别窄的纵向低响应条；被亮环短暂掩盖处会补齐，
+  正常读数隔开的分段保持独立，暗环、束挡片边缘和零星暗点不会被圈入。建议不改动现有遮罩。</p>
+  <label class="checkbox"><input type="checkbox" name="show_column_defects" ${active ? "checked" : ""}>
+  在原图叠加建议遮罩</label>
+  ${count ? `<div id="column-defect-summary" class="note">识别到 ${count} 条窄纵向低响应区，
+  共 ${fmt(suggestion.pixel_count)} 像素；红框给出每条从哪行到哪行。</div>` : ""}
+  ${count ? `<div class="table-scroll"><table>
+    <thead><tr><th scope="col">列</th><th scope="col">行（起–止）</th><th scope="col">高度</th><th scope="col">相对响应</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>
+    ${suggestion.count > 8 ? `<p class="note">仅显示前 8 条，共 ${suggestion.count} 条。</p>` : ""}
+    <div class="button-row">${action("把建议加入遮罩", "apply-column-defects")}</div>`
+    : '<p class="note">当前曝光没有达到判据的窄纵向低响应区。</p>'}
+  </section>`;
+}
+
 export async function detectorTools(ctx) {
   const {state, session, current} = ctx;
   const mode = session.detectorMode ?? "probe";
@@ -195,7 +232,8 @@ export async function detectorTools(ctx) {
   <div id="detector-summary" class="control-result"></div></section>
   ${displayPanel(state.display)}
   ${geometryPanel(state.geometry, state.marks.length, state.reference_d, session.fit)}
-  ${maskPanel(state.masks, current.imported_mask)}`;
+  ${maskPanel(state.masks, current.imported_mask)}
+  <div id="column-defect-panel"></div>`;
   ctx.controls.querySelector("[name=click_mode]").addEventListener("change", (event) => {
     session.detectorMode = event.target.value;
     delete session.maskAnchor;
@@ -274,6 +312,35 @@ export async function detectorTools(ctx) {
   });
   on("remove-mask-file", "click", () => ctx.transact("mask", "DELETE", {}, "导入遮罩已移除"));
 
+  const suggestion = await ctx.get("column-defects");
+  if (!ctx.live()) return;
+  const defectPanel = el("column-defect-panel");
+  defectPanel.innerHTML = columnDefectPanel(session, suggestion);
+  const defectToggle = defectPanel.querySelector("[name=show_column_defects]");
+  defectToggle.addEventListener("change", () => {
+    session.columnDefects = defectToggle.checked;
+    ctx.render();
+  });
+  on("apply-column-defects", "click", async () => {
+    const regions = suggestion.regions ?? [];
+    if (!regions.length || state.masks.length + regions.length > 32) {
+      ctx.notify("遮罩层数已达上限或没有可加入的建议。", true);
+      return;
+    }
+    let serial = state.masks.length;
+    const added = regions.map((r) => ({
+      kind: "rectangle",
+      title: `纵向坏区 ${++serial}`,
+      enabled: true,
+      a: [r.x0, r.y0],
+      b: [r.x1, r.y1 - 1],
+    }));
+    if (await ctx.patch({masks: [...state.masks, ...added]})) {
+      session.columnDefects = false;
+      ctx.notify(`已把 ${added.length} 条纵向坏区加入遮罩，可在上方停用或移除。`);
+    }
+  });
+
   const data = await ctx.get("detector");
   if (!ctx.live()) return;
   el("detector-summary").innerHTML = stats([
@@ -312,11 +379,14 @@ export async function detectorTools(ctx) {
         · q ${fmt(p.q_inverse_a, 4)} Å⁻¹ · 邻域有效 ${p.nearby_valid} 点`);
     }
   };
+  const showDefects = session.columnDefects && view === "counts";
   await ctx.stage({
     source:ctx.url("detector.png", {view}), reference:data.references, anchor:session.maskAnchor,
+    columnDefects: showDefects ? suggestion.regions : null,
     legend:[view === "mask" ? "探测器遮罩" : "原始探测器计数",
       `${fmt(data.range.lower)} 至 ${fmt(data.range.upper)}`, state.display.palette],
-    hint:mode === "mark" ? "沿同一条参考环点击；至少取三个分散的点" :
+    hint: showDefects ? `红框为建议的纵向低响应区，共 ${suggestion.count} 条；加入遮罩后才会参与计算` :
+      mode === "mark" ? "沿同一条参考环点击；至少取三个分散的点" :
       mode === "rectangle" ? "依次点击坏区两个对角点" :
       mode === "center" ? "点击可用环心位置" : "点击像素查看计数、方位和遮罩原因",
     onPoint:handle,
