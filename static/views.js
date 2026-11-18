@@ -74,12 +74,30 @@ function readCurveBin(ctx, data, index) {
   ctx.setReadout(`<strong>${center} ${escape(data.axis.unit)}${place} · ${fmt(value.mean[index], 3)} 计数</strong> · ${support}`);
 }
 
+function peakStatus(peak) {
+  const resolution = peak.resolution ?? {};
+  if (resolution.status === "resolved") return `分峰 ${peak.component ?? resolution.component}/2`;
+  if (resolution.status === "insufficient_evidence") return "证据不足";
+  return "单峰";
+}
+
+function peakNote(peak) {
+  const resolution = peak.resolution ?? {};
+  if (resolution.note) return resolution.note;
+  if (resolution.status === "resolved") return `峰间距 ${fmt(resolution.separation, 4)}`;
+  return "肩部未独立成峰";
+}
+
 function readPeak(ctx, peaks, index, unit) {
-  const peak = peaks.find((v) => v.cell === index);
-  if (!peak) return;
-  ctx.setReadout(`<strong>径向峰 ${fmt(peak.coordinate, 4)} ${escape(unit)}</strong>
-    · 突出度 ${fmt(peak.prominence, 3)} · 半突出度宽 ${fmt(peak.width_at_half_prominence, 4)}
-    · ${fmt(peak.valid_pixels)} 像素`);
+  const matches = peaks.filter((v) => v.cell === index);
+  if (!matches.length) return;
+  ctx.setReadout(matches.map((peak) => {
+    const fitted = peak.width_source === "component_fit";
+    return `<strong>径向峰 ${fmt(peak.coordinate, 4)} ${escape(unit)}</strong>
+      · ${fitted ? "半高宽" : "半突出度宽"} ${fmt(fitted ? peak.fwhm : peak.width_at_half_prominence, 4)}
+      · ${fitted ? "分量幅值" : "突出度"} ${fmt(peak.prominence, 3)} · ${peakStatus(peak)}
+      · ${fmt(peak.valid_pixels)} 像素`;
+  }).join("<br>"));
 }
 
 export async function curveTools(ctx) {
@@ -110,9 +128,11 @@ export async function curveTools(ctx) {
   ctx.body.innerHTML = `<div class="plot-wrap">
     ${stats(curveSummary(data))}<div id="numeric-chart"></div>
     ${kind === "profile" ? `<h3>已识别的径向峰</h3>
-    ${table(["位置", "平均计数", "突出度", "半突出度宽", "有效像素"],
+    ${table(["位置", "平均计数", "突出度/分量高", "宽度", "宽度来源", "状态", "说明", "有效像素"],
     peaks.map((p) => [`${fmt(p.coordinate, 4)} ${data.axis.unit}`, fmt(p.mean), fmt(p.prominence),
-       fmt(p.width_at_half_prominence, 4), fmt(p.valid_pixels)]))}` : ""}
+       p.width_source === "component_fit" ? fmt(p.fwhm, 4) : fmt(p.width_at_half_prominence, 4),
+       p.width_source === "component_fit" ? "分量拟合半高宽" : "半突出度宽",
+       peakStatus(p), peakNote(p), fmt(p.valid_pixels)]))}` : ""}
     ${isLine ? '<h3>横截面在原探测器的位置</h3><div id="line-image"></div>' : ""}
     </div>`;
   renderChart(el("numeric-chart"), data, {

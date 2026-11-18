@@ -1,7 +1,9 @@
 """Rebin finite detector pixel centers into radial and azimuthal output cells."""
 from dataclasses import dataclass
+import math
 
 import numpy as np
+from scipy.optimize import least_squares
 from scipy.signal import find_peaks, peak_widths
 
 from .detector_io import csv_bytes, numbers_for_json
@@ -10,6 +12,16 @@ from .geometry import AXIS_LABELS
 
 BLOCK_ROWS = 128
 MAX_ANGULAR_SPAN = 360.0
+HALF_HEIGHT_FWHM = 2.0 * math.sqrt(2.0 * math.log(2.0))
+SHOULDER_SIGMA_FLOOR = 0.25
+SHOULDER_MIN_RATIO = 0.10
+SHOULDER_MIN_NOISE = 3.0
+SHOULDER_MIN_SIGNIFICANCE = 8.0
+SHOULDER_SEPARATION = 1.5
+SHOULDER_MERGE_MARGIN = 25.0
+SHOULDER_MIN_BINS = 8
+SHOULDER_EDGE_SAMPLES = 2
+SHOULDER_NEIGHBOR_RATIO = 0.25
 
 
 @dataclass(frozen=True)
@@ -169,7 +181,8 @@ class Curve:
             "parameters": self.parameters,
         }
         if self.kind == "profile":
-            obj["peaks"] = detect_profile_peaks(self, **(peak_parameters or {}))
+            detected = detect_profile_peaks(self, **(peak_parameters or {}))
+            obj["peaks"] = resolve_profile_peaks(self, detected)
         return obj
 
     def csv(self):
@@ -327,6 +340,304 @@ def detect_profile_peaks(curve, prominence=None, maximum=18):
             })
     candidates.sort(key=lambda item: (-item["prominence"], item["coordinate"]))
     return sorted(candidates[:maximum], key=lambda item: item["coordinate"])
+
+
+def _gauss(t, amplitude, center, sigma):
+    return amplitude * np.exp(-0.5 * ((t - center) / sigma) ** 2)
+
+
+def _one_peak(p, t, background):
+    return background(t) + _gauss(t, p[0], p[1], p[2])
+
+
+def _one_peak_jacobian(p, t, background):
+    g = np.exp(-0.5 * ((t - p[1]) / p[2]) ** 2)
+    return np.column_stack([
+        g,
+        p[0] * g * (t - p[1]) / p[2] ** 2,
+        p[0] * g * (t - p[1]) ** 2 / p[2] ** 3,
+    ])
+
+
+def _skewed_peak(p, t, background):
+    sigma = np.where(t < p[1], p[2], p[3])
+    return background(t) + _gauss(t, p[0], p[1], sigma)
+
+
+def _skewed_peak_jacobian(p, t, background):
+    left = t < p[1]
+    sigma = np.where(left, p[2], p[3])
+    g = np.exp(-0.5 * ((t - p[1]) / sigma) ** 2)
+    tail = p[0] * g * (t - p[1]) ** 2
+    return np.column_stack([
+        g,
+        p[0] * g * (t - p[1]) / sigma ** 2,
+        np.where(left, tail / p[2] ** 3, 0.0),
+        np.where(left, 0.0, tail / p[3] ** 3),
+    ])
+
+
+def _two_peaks(p, t, background):
+    return background(t) + _gauss(t, p[0], p[1], p[2]) + _gauss(t, p[3], p[4], p[5])
+
+
+def _two_peaks_jacobian(p, t, background):
+    first = np.exp(-0.5 * ((t - p[1]) / p[2]) ** 2)
+    second = np.exp(-0.5 * ((t - p[4]) / p[5]) ** 2)
+    return np.column_stack([
+        first,
+        p[0] * first * (t - p[1]) / p[2] ** 2,
+        p[0] * first * (t - p[1]) ** 2 / p[2] ** 3,
+        second,
+        p[3] * second * (t - p[4]) / p[5] ** 2,
+        p[3] * second * (t - p[4]) ** 2 / p[5] ** 3,
+    ])
+
+
+def _bic(residuals, parameters):
+    size = residuals.size
+    chi = float(np.sum(residuals ** 2))
+    return size * math.log(max(chi, 1e-12) / size) + parameters * math.log(size)
+
+
+def _solve(function, jacobian, start, lower, upper, t, values, background):
+    return least_squares(
+        lambda p: function(p, t, background) - values,
+        start,
+        jac=lambda p: jacobian(p, t, background),
+        bounds=(lower, upper),
+        x_scale="jac",
+        max_nfev=200,
+        ftol=1e-6,
+        xtol=1e-6,
+        gtol=1e-6,
+    )
+
+
+def _fit_components(x, values):
+    origin = float(x[0])
+    scale = float(x[-1] - x[0])
+    t = (x - origin) / scale
+    step = float(np.median(np.diff(x))) / scale
+    left_level = float(np.median(values[:SHOULDER_EDGE_SAMPLES]))
+    right_level = float(np.median(values[-SHOULDER_EDGE_SAMPLES:]))
+
+    def background(positions):
+        return left_level + (right_level - left_level) * positions
+
+    amplitude = max(float(np.max(values)) - min(left_level, right_level), 1e-9)
+    low_sigma = max(SHOULDER_SIGMA_FLOOR * step, 1e-3)
+    sigma = max(step, 0.02)
+    center = float(t[int(np.argmax(values))])
+    lower = [0.0, 0.0, low_sigma]
+    upper = [5.0 * amplitude, 1.0, 1.0]
+    single = _solve(_one_peak, _one_peak_jacobian, [amplitude, center, sigma],
+                    lower, upper, t, values, background)
+    skewed = _solve(_skewed_peak, _skewed_peak_jacobian,
+                    [amplitude, center, sigma, sigma],
+                    lower + [low_sigma], upper + [1.0], t, values, background)
+    simple = min((single, _bic(single.fun, 3)), (skewed, _bic(skewed.fun, 4)),
+                 key=lambda item: item[1])[0]
+    residual = np.convolve(-simple.fun, np.ones(3) / 3.0, mode="same")
+    order = int(np.argmax(residual))
+    peaks = []
+    for index in (order, int(np.argmax(residual[:order + 1])),
+                  order + int(np.argmax(residual[order:]))):
+        start = [amplitude, center, sigma,
+                 max(float(residual[index]), 0.05 * amplitude),
+                 float(np.clip(t[index], low_sigma, 1.0 - low_sigma)), sigma]
+        peaks.append(_solve(_two_peaks, _two_peaks_jacobian, start,
+                            lower + [0.0, 0.0, low_sigma],
+                            upper + [5.0 * amplitude, 1.0, 1.0], t, values, background))
+    double = min(peaks, key=lambda result: float(np.sum(result.fun ** 2)))
+    return {
+        "origin": origin,
+        "scale": scale,
+        "single": single,
+        "skewed": skewed,
+        "double": double,
+        "single_bic": _bic(single.fun, 3),
+        "skewed_bic": _bic(skewed.fun, 4),
+        "double_bic": _bic(double.fun, 6),
+    }
+
+
+def _unresolved(candidate, status, reason, **detail):
+    return {
+        **candidate,
+        "fwhm": None,
+        "components": 1,
+        "prominence_source": "local_maximum",
+        "width_source": "half_prominence",
+        "resolution": {"status": status, "reason": reason, **detail},
+    }
+
+
+def _component_evidence(fit, step, values):
+    p = fit["double"].x
+    first_center = fit["origin"] + p[1] * fit["scale"]
+    second_center = fit["origin"] + p[4] * fit["scale"]
+    first_width = HALF_HEIGHT_FWHM * p[2] * fit["scale"]
+    second_width = HALF_HEIGHT_FWHM * p[5] * fit["scale"]
+    amplitudes = (float(p[0]), float(p[3]))
+    separation = abs(second_center - first_center)
+    noise = math.sqrt(float(np.sum(fit["single"].fun ** 2)) / max(1, values.size - 3))
+    jacobian = fit["double"].jac
+    covariance = np.linalg.pinv(jacobian.T @ jacobian) * (
+        float(np.sum(fit["double"].fun ** 2)) / max(1, values.size - 6)
+    )
+    errors = np.sqrt(np.maximum(np.diag(covariance), 0.0))
+    significance = min(amplitudes[0] / max(float(errors[0]), 1e-12),
+                       amplitudes[1] / max(float(errors[3]), 1e-12))
+    strength = float(np.percentile(values, 95) - np.percentile(values, 5))
+    margin = step / fit["scale"]
+    positions = (p[1], p[4])
+    return {
+        "centers": (first_center, second_center),
+        "widths": (first_width, second_width),
+        "amplitudes": amplitudes,
+        "separation": separation,
+        "weaker": min(amplitudes),
+        "threshold": max(0.02 * strength, SHOULDER_MIN_NOISE * noise),
+        "significance": float(significance),
+        "interior": (min(positions) >= margin and max(positions) <= 1.0 - margin),
+        "merge_margin": SHOULDER_MERGE_MARGIN,
+        "minimum_separation": max(SHOULDER_SEPARATION * step, 0.5 * min(first_width, second_width)),
+        "ratio": min(amplitudes) / max(max(amplitudes), 1e-12),
+    }
+
+
+def resolve_profile_peaks(curve, peaks):
+    """Split one detected maximum into two components when the profile supports it."""
+    means = curve.moments.mean
+    centers = curve.axis.centers
+    cells = centers.size
+    if cells < 3:
+        return list(peaks)
+    step = float(np.median(np.diff(centers)))
+    positions = [peak["cell"] for peak in peaks]
+    strengths = [float(peak["prominence"]) for peak in peaks]
+    limits = []
+    for index in range(len(peaks)):
+        floor = SHOULDER_NEIGHBOR_RATIO * strengths[index]
+        previous = next(
+            (positions[i] for i in range(index - 1, -1, -1) if strengths[i] >= floor), None,
+        )
+        following = next(
+            (positions[i] for i in range(index + 1, len(peaks)) if strengths[i] >= floor), None,
+        )
+        limits.append((previous, following))
+    output = []
+    covered = []
+    for index, peak in enumerate(peaks):
+        cell = peak["cell"]
+        if any(low <= cell <= high for low, high in covered):
+            continue
+        width = max(float(peak["width_at_half_prominence"]), step)
+        reach = int(math.ceil(max(5.0 * step, 1.5 * width) / step))
+        core = int(math.ceil(max(2.0 * step, width) / step))
+        left = max(0, cell - reach)
+        right = min(cells - 1, cell + reach)
+        previous, following = limits[index]
+        if previous is not None:
+            left = max(left, (previous + cell) // 2)
+        if following is not None:
+            right = min(right, (cell + following) // 2)
+        separated = [
+            other for other in positions if other != cell and abs(other - cell) <= core
+        ]
+        if separated:
+            output.append(_unresolved(peak, "single", "separate_maxima",
+                                      note="相邻极大已作为独立峰列出，不再重复分峰。"))
+            continue
+        core_window = slice(max(left, cell - core), min(right, cell + core) + 1)
+        missing = int(np.count_nonzero(~np.isfinite(means[core_window])))
+        if missing:
+            output.append(_unresolved(peak, "insufficient_evidence", "missing_bins",
+                                      missing_bins=missing,
+                                      note="证据不足：肩部区间缺少有效分箱，保留现有单峰读数。"))
+            continue
+        while left < cell and not np.isfinite(means[left]):
+            left += 1
+        while right > cell and not np.isfinite(means[right]):
+            right -= 1
+        gaps = int(np.count_nonzero(~np.isfinite(means[left:right + 1])))
+        if gaps:
+            output.append(_unresolved(peak, "insufficient_evidence", "missing_bins",
+                                      missing_bins=gaps,
+                                      note="证据不足：肩部区间缺少有效分箱，保留现有单峰读数。"))
+            continue
+        if right - left + 1 < SHOULDER_MIN_BINS:
+            output.append(_unresolved(peak, "insufficient_evidence", "too_few_bins",
+                                      bins=right - left + 1,
+                                      note="证据不足：峰区有效分箱太少，保留现有单峰读数。"))
+            continue
+        if left <= 0 or right >= cells - 1:
+            output.append(_unresolved(peak, "insufficient_evidence", "partial_profile",
+                                      note="证据不足：峰侧翼落在有效分箱范围外，保留现有单峰读数。"))
+            continue
+        if width < 1.5 * step:
+            output.append(_unresolved(peak, "single", "narrow_maximum",
+                                      note="峰宽接近单个分箱，未做肩部分峰。"))
+            continue
+        x = centers[left:right + 1]
+        values = means[left:right + 1]
+        if x.size < 4 or not np.isfinite(values).all() or x[-1] <= x[0]:
+            output.append(_unresolved(peak, "insufficient_evidence", "too_few_bins",
+                                      bins=int(x.size),
+                                      note="证据不足：峰区有效分箱太少，保留现有单峰读数。"))
+            continue
+        fit = _fit_components(x, values)
+        evidence = _component_evidence(fit, step, values)
+        best_single = min(fit["single_bic"], fit["skewed_bic"])
+        if (
+            fit["double_bic"] <= best_single - evidence["merge_margin"]
+            and evidence["separation"] >= evidence["minimum_separation"]
+            and evidence["ratio"] >= SHOULDER_MIN_RATIO
+            and evidence["weaker"] >= evidence["threshold"]
+            and evidence["significance"] >= SHOULDER_MIN_SIGNIFICANCE
+            and evidence["interior"]
+        ):
+            first, second = evidence["centers"]
+            pair = sorted(zip(evidence["centers"], evidence["widths"], evidence["amplitudes"]))
+            placed = []
+            for order, (coordinate, fwhm, amplitude) in enumerate(pair, 1):
+                near = int(np.argmin(np.abs(centers - coordinate)))
+                placed.append(near)
+                output.append({
+                    **peak,
+                    "cell": near,
+                    "coordinate": float(coordinate),
+                    "mean": float(means[near]),
+                    "prominence": float(amplitude),
+                    "width_at_half_prominence": float(fwhm),
+                    "fwhm": float(fwhm),
+                    "components": 2,
+                    "component": order,
+                    "prominence_source": "component_fit",
+                    "width_source": "component_fit",
+                    "resolution": {
+                        "status": "resolved",
+                        "component": order,
+                        "separation": float(abs(second - first)),
+                        "delta_bic": float(fit["double_bic"] - best_single),
+                        "note": f"拟合分成两个峰，间距 {abs(second - first):.3g}。",
+                    },
+                })
+            covered.append((min(placed), max(placed)))
+            continue
+        model = "asymmetric" if fit["skewed_bic"] < fit["single_bic"] else "gaussian"
+        output.append({
+            **_unresolved(peak, "single", "single_maximum"),
+            "resolution": {
+                "status": "single",
+                "reason": "single_maximum",
+                "model": model,
+                "delta_bic": float(fit["double_bic"] - best_single),
+                "note": "拟合不支持肩部独立成峰，保留单峰读数。",
+            },
+        })
+    return sorted(output, key=lambda item: item["coordinate"])
 
 
 def probe_cake(cake, radius_index, angle_index):

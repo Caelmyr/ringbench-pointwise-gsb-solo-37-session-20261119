@@ -110,13 +110,29 @@ def _profile(det):
     details = product.document()
     peaks = details["peaks"]
     table = csv_bytes(
-        [f"coordinate_{spec.unit}", "mean_count", "prominence", "half_prominence_width", "valid_pixels"],
+        [
+            f"coordinate_{spec.unit}", "mean_count", "prominence_or_component_height",
+            "half_prominence_width", "component_fwhm", "width_source", "valid_pixels",
+            "components", "resolution_status",
+        ],
         (
-            (r["coordinate"], r["mean"], r["prominence"], r["width_at_half_prominence"], r["valid_pixels"])
+            (
+                r["coordinate"], r["mean"], r["prominence"], r["width_at_half_prominence"],
+                r["fwhm"], r["width_source"], r["valid_pixels"], r["components"],
+                r["resolution"]["status"],
+            )
             for r in peaks
         ),
     )
-    return {**details["summary"], "identified_peaks": len(peaks)}, [
+    split = sum(1 for r in peaks if r["resolution"]["status"] == "resolved")
+    return {
+        **details["summary"],
+        "identified_peaks": len(peaks),
+        "resolved_components": split,
+        "unresolved_shoulders": sum(
+            1 for r in peaks if r["resolution"]["status"] == "insufficient_evidence"
+        ),
+    }, [
         _png("profile", "profile", draw_curve_png(product)),
         _table("profile", "profile", product.csv()),
         _table("radial-peaks", "profile", table),
