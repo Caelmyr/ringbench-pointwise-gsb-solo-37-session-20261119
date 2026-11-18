@@ -1,4 +1,4 @@
-import {action, api, el, escape, fields, fmt, link, numeric, on, select, stats, submit, table} from "./dom.js";
+import {action, api, checkbox, el, escape, fields, fmt, link, numeric, on, select, stats, submit, table} from "./dom.js";
 import {renderChart} from "./plot.js";
 
 const units = [["px", "半径 px"], ["mm", "半径 mm"], ["2theta", "2θ °"], ["q", "q Å⁻¹"]];
@@ -189,11 +189,15 @@ export async function differenceTools(ctx) {
     ${select("归一化","normalization",[["scale","手动比例和偏移"],["fit","拟合相对曝光"]],spec.normalization)}
     ${fields([numeric("比例","scale",spec.scale), numeric("偏移","offset",spec.offset)], 2)}
     ${numeric("对称显示窗口", "window", spec.window)}
+    ${checkbox("按环自动对齐参照图","align",spec.align)}
+    ${numeric("平移搜索半径 px","align_search_px",spec.align_search_px ?? 6,{min:1,max:16})}
     <button type="submit">生成曝光差图</button></form>
-    <div class="side-group"><p>差值为主曝光减去归一化的参照曝光。同一探测器位置上两图均有效时才计算差值。</p></div>`;
+    <div class="side-group"><p>差值为主曝光减去归一化的参照曝光。同一探测器位置上两图均有效时才计算差值。
+    自动对齐只补偿参照图几像素的平移，不改变主曝光坐标；移出画幅或被遮的计数不参与比较。</p></div>`;
   submit("diff-form",(v) => ctx.patch({difference:{
     reference:v.text("reference") || null, normalization:v.text("normalization"),
     scale:v.number("scale"), offset:v.number("offset"), window:v.number("window"),
+    align:v.has("align"), align_search_px:v.number("align_search_px"),
   }}));
   if (spec.reference === null || spec.reference === ctx.chosen.id) {
     ctx.body.innerHTML = '<p class="pending">选择另一张同尺寸曝光作为参照，即可生成差图。</p>';
@@ -201,12 +205,18 @@ export async function differenceTools(ctx) {
   }
   const data = await ctx.get("difference");
   if (!ctx.live()) return;
+  const alignment = data.alignment;
+  const notice = alignment && !alignment.reliable ?
+    `<p class="status-card" role="alert">${escape(alignment.message)}</p>` : "";
   ctx.outputs.innerHTML = `${link("下载差值 NPY",ctx.url("difference.npy"))}
     ${link("下载差图 PNG",ctx.url("difference.png",{download:1}),"quiet")}`;
-  ctx.body.innerHTML = `<div class="plot-wrap">${stats([
+  ctx.body.innerHTML = `<div class="plot-wrap">${notice}${stats([
     ["重合像素",fmt(data.overlap)], ["曝光比例",fmt(data.normalization.scale, 5)],
     ["计数偏移",fmt(data.normalization.offset, 4)], ["平均差值",fmt(data.residuals.mean, 4)],
-  ])}<div id="diff-image"></div></div>`;
+  ])}${alignment?.applied ? `<p class="note">参照图已按环对齐：X ${fmt(alignment.shift_x, 2)} px，
+    Y ${fmt(alignment.shift_y, 2)} px（相关性 ${fmt(alignment.correlation, 3)}）。</p>` :
+    alignment?.reliable ? '<p class="note">按环对齐未发现需要补偿的平移，仍按同位比较。</p>' : ""}
+    <div id="diff-image"></div></div>`;
   await ctx.stage({
     host:el("diff-image"), source:ctx.url("difference.png"), overlays:false,
     legend:[`${ctx.chosen.title} − 归一化的${data.reference.title}`,

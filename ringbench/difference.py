@@ -3,6 +3,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .alignment import Alignment, estimate_alignment, translate_reference
 from .detector_io import array_bytes, finite_summary
 from .errors import WorkbenchError
 
@@ -28,6 +29,7 @@ class Difference:
     normalization: Normalization
     signal_valid: int
     reference_valid: int
+    alignment: Alignment | None = None
 
     def document(self):
         return {
@@ -36,6 +38,7 @@ class Difference:
             "signal_valid": self.signal_valid,
             "reference_valid": self.reference_valid,
             "residuals": finite_summary(self.data, self.overlap),
+            **({"alignment": self.alignment.document()} if self.alignment is not None else {}),
         }
 
     def npy(self):
@@ -103,17 +106,30 @@ def compare(signal, signal_ok, reference, reference_ok, spec):
     overlap = signal_ok & reference_ok
     if not np.any(overlap):
         raise WorkbenchError("两帧在当前遮罩下没有重合的可用像素。")
+    alignment = None
+    compared_reference = reference
+    compared_ok = reference_ok
+    if spec.align:
+        alignment = estimate_alignment(signal, signal_ok, reference, reference_ok, spec.align_search_px)
+        if alignment.applied:
+            compared_reference, compared_ok = translate_reference(
+                reference, reference_ok, alignment.shift_x, alignment.shift_y,
+            )
+            overlap = signal_ok & compared_ok
+            if not np.any(overlap):
+                raise WorkbenchError("参照图平移后与主曝光没有重合的可用像素，请缩小搜索范围。")
     if spec.normalization == "fit":
-        norm = exposure_fit(signal, reference, overlap)
+        norm = exposure_fit(signal, compared_reference, overlap)
     else:
         norm = Normalization(spec.scale, spec.offset, "scale", {})
     data = np.full(signal.shape, np.nan, dtype=np.float32)
     with np.errstate(over="ignore"):
         data[overlap] = signal[overlap].astype(np.float64) - (
-            norm.scale * reference[overlap].astype(np.float64) + norm.offset
+            norm.scale * compared_reference[overlap].astype(np.float64) + norm.offset
         )
     if not np.all(np.isfinite(data[overlap])):
         raise WorkbenchError("差值超出可导出数值范围。")
     return Difference(
-        data, overlap, norm, int(np.count_nonzero(signal_ok)), int(np.count_nonzero(reference_ok)),
+        data, overlap, norm, int(np.count_nonzero(signal_ok)),
+        int(np.count_nonzero(reference_ok)), alignment,
     )

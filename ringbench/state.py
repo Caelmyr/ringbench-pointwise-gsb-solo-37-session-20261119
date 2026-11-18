@@ -179,6 +179,8 @@ class DifferenceSettings:
     scale: float = 1.0
     offset: float = 0.0
     window: float | None = None
+    align: bool = False
+    align_search_px: float = 6.0
 
     @classmethod
     def read(cls, value):
@@ -190,6 +192,8 @@ class DifferenceSettings:
             number(v.get("scale", 1), "参照图缩放", 0.001, 1000),
             number(v.get("offset", 0), "参照图偏移", -10 ** 12, 10 ** 12),
             number(v.get("window"), "差图显示窗口", 0.000001, 10 ** 15, allow_none=True),
+            boolean(v.get("align", False), "参照图按环对齐"),
+            number(v.get("align_search_px", 6), "对齐搜索半径 px", 1, 16),
         )
 
 
