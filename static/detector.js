@@ -29,10 +29,17 @@ function overlay(pen, canvas, config, ctx) {
     });
     const rings = config.reference ?? [];
     for (const ring of rings) oval(g.cx, g.cy, ring.radius_px, "#7df6ca83");
-    for (const [x, y] of state.marks) {
-      shape(pen, colors.orange, 1.5, () => pen.arc(X(x), Y(y), 3.8, 0, 2*Math.PI));
+    const used = session.fit?.used;
+    for (const [index, [x, y]] of state.marks.entries()) {
+      const dropped = used?.[index] === false;
+      shape(pen, dropped ? "#ff9585" : colors.orange, dropped ? 2 : 1.5, () => {
+        pen.arc(X(x), Y(y), 3.8, 0, 2*Math.PI);
+        if (dropped) { pen.moveTo(X(x)-3.5, Y(y)-3.5); pen.lineTo(X(x)+3.5, Y(y)+3.5); }
+      });
     }
-    if (session.fit) oval(session.fit.cx, session.fit.cy, session.fit.radius_px, "#f6a9fd");
+    if (session.fit && session.fit.status === "ok") {
+      oval(session.fit.cx, session.fit.cy, session.fit.radius_px, "#f6a9fd");
+    }
   }
   if (config.line) {
     const {a, b, half_width} = config.line;
@@ -130,11 +137,27 @@ function displayPanel(display) {
 }
 
 function geometryPanel(g, markCount, references, fit) {
-  const model = fit ? `<div class="status-card control-result" id="fit-result">
+  let model = "";
+  if (fit) {
+    const dropped = fit.rejected ?? [];
+    const droppedText = dropped.length
+      ? `<p class="note">未采用的标点 ${dropped.map((point) =>
+          `#${point.index + 1} (${fmt(point.x, 1)}, ${fmt(point.y, 1)})`).join("、")}</p>`
+      : "";
+    model = fit.status === "ok"
+      ? `<div class="status-card control-result" id="fit-result">
   <h3>拟合环心 ${fmt(fit.cx, 3)}, ${fmt(fit.cy, 3)}</h3>
   <p>半径 ${fmt(fit.radius_px, 3)} px · RMS ${fmt(fit.rms_px, 3)} px</p>
-  <p>覆盖 ${fmt(fit.span_deg, 1)}° · ${fit.count} 个标点</p>
-  ${action("应用拟合环心", "apply-fit")}</div>` : "";
+  <p>覆盖 ${fmt(fit.span_deg, 1)}° · 采用 ${fit.used_count}/${fit.count} 个标点</p>
+  ${droppedText}
+  ${action("应用拟合环心", "apply-fit")}</div>`
+      : `<div class="status-card control-result" id="fit-result" role="alert">
+  <h3>环心未能确定</h3>
+  <p>${escape(fit.message)}</p>
+  ${dropped.length ? `<ul class="note">${dropped.map((point) =>
+    `<li>#${point.index + 1} (${fmt(point.x, 1)}, ${fmt(point.y, 1)})</li>`).join("")}</ul>` : ""}
+  <p>现有环心保持 ${fmt(g.cx, 3)}, ${fmt(g.cy, 3)}。</p></div>`;
+  }
   return `<section class="side-group">
   <h2>几何与标定</h2>
   <form id="geometry-form" class="fields">
@@ -150,7 +173,7 @@ function geometryPanel(g, markCount, references, fit) {
     <input name="d_values" value="${escape(references.map((x) => x.toFixed(5)).join(" "))}"></label>
     <button type="submit" class="secondary">更新参考环</button></form>
     <form id="distance-form" class="fields">
-    ${numeric("拟合参考环半径 px", "radius_px", fit?.radius_px, {required:true})}
+    ${numeric("拟合参考环半径 px", "radius_px", fit?.status === "ok" ? fit.radius_px : undefined, {required:true})}
     ${numeric("已知 d 值 Å", "d_a", references[1] ?? references[0], {required:true})}
     <button type="submit" class="quiet">用参考环估计距离</button></form>
   </details>
@@ -217,7 +240,7 @@ export async function detectorTools(ctx) {
   });
   on("apply-fit", "click", async () => {
     const fit = session.fit;
-    if (!fit) return;
+    if (fit?.status !== "ok") return;
     if (await ctx.patch({geometry: {...state.geometry, cx:fit.cx, cy:fit.cy}})) {
       delete session.fit;
       ctx.render();
